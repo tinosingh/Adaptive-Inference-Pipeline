@@ -1,0 +1,429 @@
+import multiprocessing
+import time
+import numpy as np
+import ctypes
+import itertools
+import queue # For result_queue.Empty exception
+
+# --- Configuration Constants ---
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+FRAME_CHANNELS = 3  # RGB
+FRAME_SIZE = FRAME_WIDTH * FRAME_HEIGHT * FRAME_CHANNELS  # Total bytes per frame
+BUFFER_SLOTS = 10  # Number of frames the shared buffer can hold
+FPS_TARGET = 15    # Target frames per second for ingestion by the Manager
+TOTAL_FRAMES_TO_PROCESS = 50 # Total frames to simulate for the pipeline
+
+# --- Inference Time Simulation (in seconds per frame) ---
+# These values simulate the inverse of the relative speeds of the hardware backends.
+ANE_INFERENCE_TIME = 0.02  # Apple Neural Engine: Very fast (simulates ~50 FPS)
+GPU_INFERENCE_TIME = 0.05  # GPU (MPS): Medium speed (simulates ~20 FPS)
+CPU_INFERENCE_TIME = 0.1   # CPU: Slowest speed (simulates ~10 FPS)
+
+# --- Weighted Assignment Ratios ---
+# These weights are derived from the inverse of inference times (normalized)
+# Ratio: ANE : GPU : CPU = (1/ANE_INFERENCE_TIME) : (1/GPU_INFERENCE_TIME) : (1/CPU_INFERENCE_TIME)
+# Calculation: 1/0.02 : 1/0.05 : 1/0.1 = 50 : 20 : 10
+# Normalized by dividing by 10 (common divisor): 5 : 2 : 1
+ANE_WEIGHT = 5
+GPU_WEIGHT = 2
+CPU_WEIGHT = 1
+TOTAL_WEIGHT = ANE_WEIGHT + GPU_WEIGHT + CPU_WEIGHT # Sum of weights: 5 + 2 + 1 = 8
+
+# --- Shared Memory Slot Metadata Structure ---
+# Using ctypes.Structure to define a clear layout for metadata in shared memory.
+class SlotMetadata(ctypes.Structure):
+    _fields_ = [
+        ("frame_id", ctypes.c_long),     # Unique ID of the frame in this slot
+        ("status", ctypes.c_int),        # Current status of the slot (e.g., FREE, READY)
+        ("backend_hint", ctypes.c_int)   # Hint for which worker backend should process this frame
+    ]
+
+# --- Slot Statuses ---
+# Define states for shared memory slots to manage their lifecycle.
+FREE = 0      # Slot is empty and available for writing
+WRITING = 1   # Frame data is currently being written to the slot (by Manager)
+READY = 2     # Frame data is fully written and ready for a worker to pick up
+READING = 3   # A worker has claimed this slot and is processing its frame
+
+# --- Backend Hint IDs ---
+# Map backend types to integer IDs for use in shared metadata.
+HINT_ANE = 0
+HINT_GPU = 1
+HINT_CPU = 2
+
+# --- Helper Functions for Shared Memory ---
+
+def create_shared_buffers(num_slots, frame_data_size):
+    """
+    Creates shared memory blocks for frame data and slot metadata.
+    Returns SharedMemory objects and a ctypes view of the metadata array.
+    """
+    # Shared memory for actual frame pixel data
+    data_shm = multiprocessing.shared_memory.SharedMemory(create=True, size=num_slots * frame_data_size)
+
+    # Shared memory for slot metadata (an array of SlotMetadata structs)
+    metadata_size = num_slots * ctypes.sizeof(SlotMetadata)
+    metadata_shm = multiprocessing.shared_memory.SharedMemory(create=True, size=metadata_size)
+
+    # Wrap the metadata shared memory buffer with a ctypes array to access structs
+    metadata_array_view = (SlotMetadata * num_slots).from_buffer(metadata_shm.buf)
+
+    # Initialize all metadata slots to FREE
+    for i in range(num_slots):
+        metadata_array_view[i].frame_id = -1
+        metadata_array_view[i].status = FREE
+        metadata_array_view[i].backend_hint = -1 # No backend hint initially
+
+    return data_shm, metadata_shm, metadata_array_view
+
+def get_metadata_view(shm_buf, num_slots):
+    """
+    Returns a ctypes view of the metadata shared memory buffer.
+    This is used by worker processes to attach to the existing shared memory.
+    """
+    return (SlotMetadata * num_slots).from_buffer(shm_buf)
+
+# --- Worker Process Function ---
+
+def worker_process(worker_name, backend_type, inference_time, data_shm_name, metadata_shm_name, num_slots, frame_data_size, result_queue, backend_hint_id, data_available_cond, slot_freed_cond, shutdown_event):
+    """
+    Generic worker process. Attaches to shared memory, processes frames, and puts results into a queue.
+    Uses Condition variables for efficient waiting and a shutdown event for graceful exit.
+    """
+    print(f"Worker {worker_name} ({backend_type}) started.")
+
+    # Attach to the existing shared memory segments by name
+    data_shm = multiprocessing.shared_memory.SharedMemory(name=data_shm_name)
+    metadata_shm = multiprocessing.shared_memory.SharedMemory(name=metadata_shm_name)
+    metadata_array = get_metadata_view(metadata_shm.buf, num_slots)
+
+    try:
+        while not shutdown_event.is_set(): # Loop until shutdown event is set
+            found_task = False
+            
+            with data_available_cond: # Acquire the lock for data_available_cond before checking metadata
+                # Check if the slot is READY and is hinted for this worker's backend
+                for i in range(num_slots):
+                    if metadata_array[i].status == READY and metadata_array[i].backend_hint == backend_hint_id:
+                        metadata_array[i].status = READING # Mark slot as being read/processed
+                        current_frame_id = metadata_array[i].frame_id
+                        current_slot_idx = i
+                        found_task = True
+                        break
+                
+                if not found_task:
+                    # If no task found, wait for a notification that data is available
+                    # Add a timeout to periodically check shutdown_event
+                    data_available_cond.wait(timeout=0.1) 
+                    if shutdown_event.is_set():
+                        break # Exit if shutdown event is set while waiting
+
+            if found_task:
+                # Calculate offset for frame data within the shared memory buffer
+                frame_data_offset = current_slot_idx * frame_data_size
+                
+                # Create a view of the frame bytes directly from shared memory (zero-copy)
+                frame_bytes_view = data_shm.buf[frame_data_offset : frame_data_offset + frame_data_size]
+                
+                # --- Actual Inference Integration Point ---
+                # In a real application, you would replace the following lines with your
+                # actual image loading, preprocessing, and model inference steps.
+                # Example:
+                # frame_array = np.frombuffer(frame_bytes_view, dtype=np.uint8).reshape((FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS))
+                #
+                # if backend_type == "ANE":
+                #     # Load Core ML model and predict
+                #     # coreml_model.predict(frame_array)
+                # elif backend_type == "GPU":
+                #     # Load PyTorch model, move to MPS, and predict
+                #     # torch_model.to('mps')(torch.from_numpy(frame_array))
+                # elif backend_type == "CPU":
+                #     # Load PyTorch model, move to CPU, and predict
+                #     # torch_model.to('cpu')(torch.from_numpy(frame_array))
+                #
+                # simulated_inference_result = actual_model_output
+
+                print(f"Worker {worker_name} ({backend_type}) processing frame {current_frame_id} from slot {current_slot_idx}...")
+                start_time = time.time()
+                
+                # Simulate inference computation
+                time.sleep(inference_time)
+                
+                end_time = time.time()
+                processing_time = end_time - start_time
+
+                # Simulate inference result (e.g., detected bounding boxes)
+                simulated_result = f"Result for frame {current_frame_id} by {backend_type}"
+                result_queue.put((current_frame_id, simulated_result, backend_type, processing_time)) # Put result back for Manager
+
+                with slot_freed_cond: # Use the condition's lock for metadata access
+                    metadata_array[current_slot_idx].frame_id = -1 # Clear frame ID
+                    metadata_array[current_slot_idx].status = FREE # Mark slot as FREE for next use
+                    metadata_array[current_slot_idx].backend_hint = -1 # Clear backend hint
+                    slot_freed_cond.notify() # Notify Manager that a slot has become free
+                print(f"Worker {worker_name} ({backend_type}) finished frame {current_frame_id}. Slot {current_slot_idx} freed.")
+
+    except KeyboardInterrupt:
+        print(f"Worker {worker_name} ({backend_type}) shutting down due to KeyboardInterrupt.")
+    except Exception as e:
+        print(f"Worker {worker_name} ({backend_type}) encountered an error: {e}")
+    finally:
+        # Close the shared memory connections
+        data_shm.close()
+        metadata_shm.close()
+        print(f"Worker {worker_name} ({backend_type}): Closed shared memory connections.")
+
+# --- Manager Process Function ---
+
+def manager_process(data_shm_name, metadata_shm_name, num_slots, frame_data_size, result_queue, data_available_cond, slot_freed_cond, shutdown_event, backend_cycle):
+    """
+    Manager process. Orchestrates frame ingestion, weighted assignment, and result collection.
+    Uses Condition variables for efficient waiting and handles result re-ordering.
+    """
+    print("Manager process started.")
+
+    # Attach to the existing shared memory segments by name
+    data_shm = multiprocessing.shared_memory.SharedMemory(name=data_shm_name)
+    metadata_shm = multiprocessing.shared_memory.SharedMemory(name=metadata_shm_name)
+    metadata_array = get_metadata_view(metadata_shm.buf, num_slots)
+
+    frame_counter = 0 # Counter for frames generated by the Manager
+    total_processed_frames = 0 # Counter for frames whose results have been collected
+
+    # For Result Ordering
+    results_buffer = {} # Stores out-of-order results: {frame_id: (result_message, backend_type, processing_time)}
+    next_expected_frame_id = 0
+
+    # For Backpressure Monitoring
+    manager_buffer_full_waits = 0 # Counts how many times manager had to wait for a free slot
+
+    # For Monitoring / Metrics
+    frames_processed_by_backend = {HINT_ANE: 0, HINT_GPU: 0, HINT_CPU: 0}
+    latencies_by_backend = {HINT_ANE: [], HINT_GPU: [], HINT_CPU: []}
+    
+    start_pipeline_time = time.time()
+
+    try:
+        while total_processed_frames < TOTAL_FRAMES_TO_PROCESS:
+            # --- Slot Assignment Loop ---
+            assigned_this_iteration = False
+            with slot_freed_cond: # Lock acquired for metadata access
+                slot_idx = -1
+                # Find the first available FREE slot in the ring buffer
+                for i in range(num_slots):
+                    if metadata_array[i].status == FREE:
+                        slot_idx = i
+                        break
+
+                if slot_idx == -1:
+                    # Shared buffer is full, Manager waits for a slot to be freed
+                    print("Manager: Shared buffer full. Waiting for a slot to free...")
+                    manager_buffer_full_waits += 1 # Increment backpressure counter
+                    slot_freed_cond.wait() # Wait until a worker notifies a slot is free
+                    # After waiting, the loop will re-check for a free slot in the next iteration
+
+                else: # A free slot was found
+                    metadata_array[slot_idx].status = WRITING # Mark slot as WRITING
+                    
+                    # Write frame data to the selected shared memory slot
+                    frame_data_offset = slot_idx * frame_data_size
+                    data_shm.buf[frame_data_offset : frame_data_offset + frame_data_size] = frame_bytes
+
+                    # --- Weighted Assignment Logic (using itertools.cycle) ---
+                    target_backend_hint = next(backend_cycle) # Get the next backend from the pre-shuffled cycle
+                    
+                    # Update slot metadata to mark it READY and hint the target backend
+                    metadata_array[slot_idx].frame_id = frame_counter
+                    metadata_array[slot_idx].status = READY
+                    metadata_array[slot_idx].backend_hint = target_backend_hint
+                    
+                    print(f"Manager assigned frame {frame_counter} to slot {slot_idx} for {'ANE' if target_backend_hint==HINT_ANE else 'GPU' if target_backend_hint==HINT_GPU else 'CPU'} worker.")
+                    frame_counter += 1
+                    assigned_this_iteration = True
+                    
+                    with data_available_cond: # Acquire the lock for data_available_cond to notify workers
+                        data_available_cond.notify_all() # Notify all workers that new data is READY
+
+            # --- Pacing to Maintain Target FPS ---
+            # Ensures frames are generated and assigned by the Manager at the desired rate.
+            # Only pace if a frame was successfully assigned in this iteration
+            if assigned_this_iteration:
+                elapsed_time_generation = time.time() - start_pipeline_time
+                expected_time_for_current_frame_gen = frame_counter / FPS_TARGET
+                if expected_time_for_current_frame_gen > elapsed_time_generation:
+                    time.sleep(expected_time_for_current_frame_gen - elapsed_time_generation)
+            
+            # --- Collect Results from Workers and Re-order ---
+            while not result_queue.empty():
+                try:
+                    # Use queue.Empty from the standard 'queue' module
+                    frame_id, result_message, backend_used, proc_time = result_queue.get(timeout=0.01)
+                    results_buffer[frame_id] = (result_message, backend_used, proc_time)
+                    
+                    # Update metrics
+                    frames_processed_by_backend[backend_used] += 1
+                    latencies_by_backend[backend_used].append(proc_time)
+
+                    # Try to output results in order
+                    while next_expected_frame_id in results_buffer:
+                        ordered_result_msg, ordered_backend, ordered_proc_time = results_buffer.pop(next_expected_frame_id)
+                        print(f"Manager (Ordered Output): Frame {next_expected_frame_id} processed by {'ANE' if ordered_backend==HINT_ANE else 'GPU' if ordered_backend==HINT_GPU else 'CPU'} in {ordered_proc_time:.4f}s - {ordered_result_msg}")
+                        total_processed_frames += 1
+                        next_expected_frame_id += 1
+                        
+                        if total_processed_frames >= TOTAL_FRAMES_TO_PROCESS:
+                            break # Exit if target reached during ordered output
+                except queue.Empty: # Corrected exception type
+                    break # No results available, continue frame generation/assignment
+            
+            # If manager has processed all required frames, break main loop
+            if total_processed_frames >= TOTAL_FRAMES_TO_PROCESS:
+                break
+
+
+    except KeyboardInterrupt:
+        print("Manager process shutting down due to KeyboardInterrupt.")
+    except Exception as e:
+        print(f"Manager encountered an error: {e}")
+    finally:
+        # Signal workers to shut down cleanly
+        print("Manager: Signaling workers to shut down...")
+        shutdown_event.set() 
+        # Notify all workers one last time to wake them up and let them check the shutdown_event
+        with data_available_cond:
+            data_available_cond.notify_all() 
+        
+        # Close shared memory connections
+        data_shm.close()
+        metadata_shm.close()
+        print("Manager: Closed shared memory connections.")
+
+        # --- Final Metrics Output ---
+        print("\n--- Pipeline Metrics Summary ---")
+        print(f"Total Frames Generated & Assigned: {frame_counter}")
+        print(f"Total Frames Processed & Ordered: {total_processed_frames}")
+        print(f"Manager Buffer Full Waits (Backpressure indicator): {manager_buffer_full_waits}")
+        
+        backend_names = {HINT_ANE: 'ANE', HINT_GPU: 'GPU', HINT_CPU: 'CPU'}
+        for backend_id, count in frames_processed_by_backend.items():
+            backend_name = backend_names.get(backend_id, "UNKNOWN")
+            
+            avg_latency = np.mean(latencies_by_backend[backend_id]) if latencies_by_backend[backend_id] else 0
+            print(f"  {backend_name} Worker:")
+            print(f"    Frames Processed: {count}")
+            print(f"    Average Latency: {avg_latency:.4f}s")
+        
+        # Calculate overall throughput
+        overall_throughput_time = time.time() - start_pipeline_time if total_processed_frames > 0 else 0
+        overall_fps = total_processed_frames / overall_throughput_time if overall_throughput_time > 0 else 0
+        print(f"Overall Achieved Throughput (processed frames/time): {overall_fps:.2f} FPS")
+        print("--- End Metrics Summary ---")
+
+
+# --- Main Execution Block ---
+
+if __name__ == "__main__":
+    print("--- Starting Adaptive Inference Pipeline Example ---")
+
+    # 1. Create shared memory objects for data and metadata
+    data_shm, metadata_shm, initial_metadata_array_view = create_shared_buffers(BUFFER_SLOTS, FRAME_SIZE)
+
+    # 2. Initialize a shared Lock and two Condition variables for communication
+    # The Lock is implicitly used by Condition variables.
+    global_metadata_lock = multiprocessing.Lock() # Used by Condition variables internally.
+    data_available_cond = multiprocessing.Condition(lock=global_metadata_lock) # Manager notifies workers when data is ready
+    slot_freed_cond = multiprocessing.Condition(lock=global_metadata_lock)    # Workers notify Manager when a slot is free
+    
+    # 3. Create a shared Event for graceful shutdown
+    shutdown_event = multiprocessing.Event()
+
+    # 4. Create a queue for workers to send inference results back to the Manager
+    result_queue = multiprocessing.Queue()
+
+    # 5. Prepare weighted scheduling cycle (itertools.cycle)
+    weighted_backends = (
+        [HINT_ANE] * ANE_WEIGHT + 
+        [HINT_GPU] * GPU_WEIGHT + 
+        [HINT_CPU] * CPU_WEIGHT
+    )
+    # Shuffle the list to prevent sequential bias, then create an infinite iterator
+    np.random.shuffle(weighted_backends) 
+    backend_cycle = itertools.cycle(weighted_backends)
+    
+    # 6. Initialize a list to hold worker process objects
+    worker_processes = []
+    
+    # 7. Start Worker Processes
+    # Each worker is a separate process, configured with its simulated inference time and backend hint.
+    worker_processes.append(multiprocessing.Process(
+        target=worker_process, 
+        args=("ANE_Worker", "ANE", ANE_INFERENCE_TIME, data_shm.name, metadata_shm.name, 
+              BUFFER_SLOTS, FRAME_SIZE, result_queue, HINT_ANE, 
+              data_available_cond, slot_freed_cond, shutdown_event)
+    ))
+    worker_processes.append(multiprocessing.Process(
+        target=worker_process, 
+        args=("GPU_Worker", "GPU", GPU_INFERENCE_TIME, data_shm.name, metadata_shm.name, 
+              BUFFER_SLOTS, FRAME_SIZE, result_queue, HINT_GPU, 
+              data_available_cond, slot_freed_cond, shutdown_event)
+    ))
+    worker_processes.append(multiprocessing.Process(
+        target=worker_process, 
+        args=("CPU_Worker", "CPU", CPU_INFERENCE_TIME, data_shm.name, metadata_shm.name, 
+              BUFFER_SLOTS, FRAME_SIZE, result_queue, HINT_CPU, 
+              data_available_cond, slot_freed_cond, shutdown_event)
+    ))
+
+    for p in worker_processes:
+        p.start() # Start each worker process
+
+    # 8. Start Manager Process
+    # The manager orchestrates the entire pipeline.
+    manager = multiprocessing.Process(
+        target=manager_process, 
+        args=(data_shm.name, metadata_shm.name, BUFFER_SLOTS, FRAME_SIZE, result_queue, 
+              data_available_cond, slot_freed_cond, shutdown_event, backend_cycle)
+    )
+    manager.start() # Start the manager process
+
+    try:
+        manager.join() # Wait for the manager to finish processing all frames
+
+        # Manager has finished its work and set the shutdown_event.
+        # Now, wait for workers to naturally exit their loops.
+        print("\nManager process finished. Waiting for workers to complete remaining tasks and shut down gracefully...")
+        for p in worker_processes:
+            p.join() # Wait for each worker process to naturally terminate
+
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt detected in main. Signaling shutdown and cleaning up.")
+        shutdown_event.set() # Set shutdown event
+        # Notify all workers one last time to wake them up and let them check the shutdown_event
+        with data_available_cond:
+            data_available_cond.notify_all() 
+        
+        manager.join(timeout=5) # Give manager a chance to finish cleanly
+        if manager.is_alive():
+            manager.terminate()
+            manager.join()
+
+        for p in worker_processes:
+            p.join(timeout=5) # Give workers a chance to finish cleanly
+            if p.is_alive():
+                p.terminate()
+                p.join()
+    finally:
+        # 9. Clean up Shared Memory Segments
+        # This is crucial to release the memory back to the system.
+        print("Unlinking shared memory segments...")
+        try:
+            data_shm.unlink()    # Unlink the frame data shared memory
+            metadata_shm.unlink() # Unlink the metadata shared memory
+            print("Shared memory unlinked successfully.")
+        except FileNotFoundError:
+            print("Shared memory already unlinked or not found.")
+        except Exception as e:
+            print(f"Error unlinking shared memory: {e}")
+
+    print("--- Adaptive Inference Pipeline Example Finished ---")
