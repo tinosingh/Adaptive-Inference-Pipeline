@@ -44,7 +44,7 @@ Minimizes bandwidth usage and I/O latency.
 
 Requires lightweight synchronization (e.g., reference counting or ring buffer locking).
 
-<img src="uploaded:image_abb000.png-be8d8f3b-b97d-400d-b13d-5da713dc878d" alt="Adaptive Inference Pipeline Architecture">
+<img src="https://github.com/tinosingh/Adaptive-Inference-Pipeline/blob/main/img2.jpg" alt="Adaptive Inference Pipeline Architecture">
 
 3. Weighted Hybrid Task Assignment
 3.1 Calibration Phase
@@ -61,7 +61,7 @@ Example: For 11 frames → {ANE: 7, GPU: 3, CPU: 1}
 
 All workers complete sub-batches simultaneously, minimizing idle time.
 
-<img src="uploaded:image_abb03e.png-44407fed-32cf-4a5e-8aa5-b6ccddd3de7c" alt="Weighted Task Assignment Cycle">
+<img src="https://github.com/tinosingh/Adaptive-Inference-Pipeline/blob/main/img1.jpg" alt="Weighted Task Assignment Cycle">
 
 3.3 Benefits
 Predictable throughput.
